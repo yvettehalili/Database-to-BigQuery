@@ -35,15 +35,22 @@ def load_data_from_sql():
 def convert_to_bigquery_format(data):
     rows_to_insert = []
     for row in data:
-        rows_to_insert.append({
-            "ID": int(row[0]),
-            "BackupDate": datetime.strptime(row[1], '%Y-%m-%d %H:%M:%S.%f'),
-            "Server": row[2],
-            "Database": row[3],
-            "Size": int(row[4]),
-            "State": row[6],
-            "LastUpdate": datetime.strptime(row[7], '%Y-%m-%d %H:%M:%S.%f')
-        })
+        try:
+            # Parse datetime fields, handle possible trailing characters
+            backup_date = row[1].split(')')[0].strip()  # remove any trailing characters
+            last_update = row[7].split(')')[0].strip()  # remove any trailing characters
+            
+            rows_to_insert.append({
+                "ID": int(row[0]),
+                "BackupDate": datetime.strptime(backup_date, '%Y-%m-%d %H:%M:%S.%f'),
+                "Server": row[2],
+                "Database": row[3],
+                "Size": int(row[4]),
+                "State": row[6],
+                "LastUpdate": datetime.strptime(last_update, '%Y-%m-%d %H:%M:%S.%f')
+            })
+        except ValueError as e:
+            print(f"Error parsing date for row {row}: {e}")
     return rows_to_insert
 
 def insert_data_to_bigquery(data):
