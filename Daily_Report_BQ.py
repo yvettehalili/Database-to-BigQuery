@@ -65,8 +65,11 @@ queries = [
 # Extract data and write to JSON file
 rows_to_insert = []
 for query in queries:
+    print(f"Executing query:\n{query}\n")  # Debugging: Print the query
     cursor.execute(query)
-    for row in cursor.fetchall():
+    result = cursor.fetchall()
+    print(f"Query result: {result}\n")  # Debugging: Print the query result
+    for row in result:
         Server, Size, SizeName, Location, DBEngine, OS = row
         Error = "Yes" if Size == 0.00 and SizeName == "B" else "No"
         rows_to_insert.append({
