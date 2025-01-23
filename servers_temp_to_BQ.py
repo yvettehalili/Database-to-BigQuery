@@ -2,6 +2,7 @@ import mysql.connector
 import json
 import os
 from google.cloud import bigquery
+from datetime import datetime
 
 # Set up variables
 KEY_FILE = '/root/jsonfiles/ti-dba-prod-01.json'
