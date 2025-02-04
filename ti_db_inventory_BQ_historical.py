@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import os
 import glob
 import argparse
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from urllib.parse import quote_plus
 
 # Set up logging
@@ -24,9 +24,14 @@ CREDENTIALS_PATH = "/backup/configs/db_credentials.conf"
 mysql_config = {}
 
 with open(CREDENTIALS_PATH, "r") as f:
-    creds = f.read().splitlines()
-    mysql_config["user"] = creds[0].split("=")[1].strip()
-    mysql_config["password"] = creds[1].split("=")[1].strip()
+    creds = {}
+    for line in f:
+        if "=" in line:
+            key, value = line.strip().split("=")
+            creds[key.strip()] = value.strip()
+
+mysql_config["user"] = creds.get("DB_USR", "")
+mysql_config["password"] = creds.get("DB_PWD", "")
 
 # Load table schemas from JSON file
 SCHEMA_PATH = "/backup/configs/MYSQL_to_BigQuery_tables.json"
@@ -74,7 +79,7 @@ def extract_from_mysql(table_name, is_daily=False):
     try:
         engine = create_engine_url()
         
-        if is_daily:
+        if is_daily and table_name in ['backup_log', 'daily_log']:
             yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
             query = f"SELECT * FROM {table_name} WHERE DATE(backup_date) = '{yesterday}'"
         else:
@@ -86,12 +91,9 @@ def extract_from_mysql(table_name, is_daily=False):
         json_filename = f"{table_name}_{timestamp}.json"
         json_path = os.path.join(DUMPS_DIR, json_filename)
         
-        for column in df.select_dtypes(include=['datetime64[ns]']).columns:
-            df[column] = df[column].astype(str)
+        df.to_json(json_path, orient='records', lines=True, date_format='iso')
         
-        df.to_json(json_path, orient='records', lines=True)
-        
-        logging.info(f"Successfully extracted data from MySQL table: {table_name}")
+        logging.info(f"Successfully extracted {len(df)} rows from MySQL table: {table_name}")
         logging.info(f"Saved extracted data to: {json_path}")
         
         return df
@@ -107,25 +109,22 @@ def transform_data(df, table_name):
     try:
         if table_name == 'servers_temp':
             bool_columns = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat', 
-                            'encrypted', 'ssl', 'backup', 'load', 'size', 'active']
+                          'encrypted', 'ssl', 'backup', 'load', 'size', 'active']
             for col in bool_columns:
                 if col in df.columns:
                     df[col] = df[col].astype(bool)
         
         datetime_columns = {
             'backup_log': ['backup_date', 'last_update'],
-            'daily_log': ['BackupDate', 'LastUpdate'],
+            'daily_log': ['backup_date', 'last_update'],
         }
         
         if table_name in datetime_columns:
             for col in datetime_columns[table_name]:
                 if col in df.columns:
                     df[col] = pd.to_datetime(df[col], errors='coerce')
-
-        # Ensure all datetime columns are in UTC format
-        for col in df.select_dtypes(include=['datetime64[ns]']).columns:
-            df[col] = df[col].dt.tz_localize('UTC', errors='coerce')
-
+                    df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+        
         if table_name == 'daily_log':
             df = df.rename(columns={
                 'backup_date': 'BackupDate',
@@ -171,7 +170,15 @@ def load_to_bigquery(df, table_name, is_daily=False):
         
         job_config.write_disposition = bigquery.WriteDisposition.WRITE_APPEND if is_daily else bigquery.WriteDisposition.WRITE_TRUNCATE
         
-        job = bq_client.load_table_from_dataframe(df, table_ref, job_config=job_config)
+        # Convert DataFrame to newline-delimited JSON
+        json_data = df.to_json(orient='records', lines=True)
+        
+        # Load data from JSON string
+        job = bq_client.load_table_from_json(
+            json.loads(json_data),
+            table_ref,
+            job_config=job_config
+        )
         job.result()  # Wait for the job to complete
         
         table = bq_client.get_table(table_ref)
@@ -188,7 +195,7 @@ def get_mysql_tables():
     try:
         engine = create_engine_url()
         with engine.connect() as connection:
-            result = connection.execute("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'").fetchall()
+            result = connection.execute(text("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'"))
             return [row[0] for row in result]
     finally:
         if engine:
@@ -216,9 +223,13 @@ def run_etl(is_daily=False):
         raise
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run ETL process for MySQL to BigQuery")
-    parser.add_argument("--daily", action="store_true", help="Run daily update instead of full load")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--daily", action="store_true", help="Run daily ETL process")
     args = parser.parse_args()
-
-    run_etl(is_daily=args.daily)
-
+    
+    try:
+        run_etl(is_daily=args.daily)
+        logging.info("ETL process completed successfully")
+    except Exception as e:
+        logging.error(f"Script execution failed: {e}")
+        raise
