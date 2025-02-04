@@ -77,7 +77,8 @@ def create_engine_url():
         raise
 
 def get_mysql_tables():
-    """Get list of MySQL tables"""
+    """Get list of MySQL tables we want to process"""
+    allowed_tables = ['backup_log', 'daily_log', 'servers_temp']
     engine = None
     try:
         engine = create_engine_url()
@@ -89,8 +90,9 @@ def get_mysql_tables():
             query = "SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'"
             df = pd.read_sql(query, connection)
             
-            tables = df.iloc[:, 0].tolist()
-            logging.info(f"Tables found in MySQL: {tables}")
+            # Filter only the tables we want to process
+            tables = [table for table in df.iloc[:, 0].tolist() if table in allowed_tables]
+            logging.info(f"Tables to be processed: {tables}")
             return tables
     except Exception as e:
         logging.error(f"Error fetching MySQL tables: {e}")
@@ -217,7 +219,7 @@ def run_etl(is_daily=False):
     """Main ETL process"""
     try:
         tables = get_mysql_tables()
-        logging.info(f"Found tables in MySQL: {tables}")
+        logging.info(f"Found tables to process: {tables}")
 
         for table_name in tables:
             logging.info(f"Processing table: {table_name}")
