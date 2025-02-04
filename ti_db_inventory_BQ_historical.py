@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import os
 import glob
 import argparse
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from urllib.parse import quote_plus
 
 # Set up logging
@@ -24,14 +24,9 @@ CREDENTIALS_PATH = "/backup/configs/db_credentials.conf"
 mysql_config = {}
 
 with open(CREDENTIALS_PATH, "r") as f:
-    creds = {}
-    for line in f:
-        if "=" in line:
-            key, value = line.strip().split("=")
-            creds[key.strip()] = value.strip()
-
-mysql_config["user"] = creds.get("DB_USR", "")
-mysql_config["password"] = creds.get("DB_PWD", "")
+    creds = f.read().splitlines()
+    mysql_config["user"] = creds[0].split("=")[1].strip()
+    mysql_config["password"] = creds[1].split("=")[1].strip()
 
 # Load table schemas from JSON file
 SCHEMA_PATH = "/backup/configs/MYSQL_to_BigQuery_tables.json"
@@ -112,7 +107,7 @@ def transform_data(df, table_name):
     try:
         if table_name == 'servers_temp':
             bool_columns = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat', 
-                          'encrypted', 'ssl', 'backup', 'load', 'size', 'active']
+                            'encrypted', 'ssl', 'backup', 'load', 'size', 'active']
             for col in bool_columns:
                 if col in df.columns:
                     df[col] = df[col].astype(bool)
@@ -125,8 +120,12 @@ def transform_data(df, table_name):
         if table_name in datetime_columns:
             for col in datetime_columns[table_name]:
                 if col in df.columns:
-                    df[col] = pd.to_datetime(df[col])
-        
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+
+        # Ensure all datetime columns are in UTC format
+        for col in df.select_dtypes(include=['datetime64[ns]']).columns:
+            df[col] = df[col].dt.tz_localize('UTC', errors='coerce')
+
         if table_name == 'daily_log':
             df = df.rename(columns={
                 'backup_date': 'BackupDate',
@@ -189,7 +188,7 @@ def get_mysql_tables():
     try:
         engine = create_engine_url()
         with engine.connect() as connection:
-            result = connection.execute(text("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'"))
+            result = connection.execute("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'").fetchall()
             return [row[0] for row in result]
     finally:
         if engine:
@@ -214,9 +213,11 @@ def run_etl(is_daily=False):
         
     except Exception as e:
         logging.error(f"ETL process failed: {e}")
+        raise
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--daily", action="store_true", help="Run daily ETL process")
+    parser = argparse.ArgumentParser(description="Run ETL process for MySQL to BigQuery")
+    parser.add_argument("--daily", action="store_true", help="Run daily update instead of full load")
     args = parser.parse_args()
+
     run_etl(is_daily=args.daily)
