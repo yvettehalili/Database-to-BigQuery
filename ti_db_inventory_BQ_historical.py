@@ -9,7 +9,7 @@ import glob
 import argparse
 from sqlalchemy import create_engine
 from urllib.parse import quote_plus
-import configparser
+from configparser import ConfigParser
 
 # Set up logging
 CURRENT_DATE = datetime.now().strftime("%Y-%m-%d")
@@ -22,29 +22,24 @@ os.makedirs(DUMPS_DIR, exist_ok=True)
 
 # Load MySQL credentials from config file
 CREDENTIALS_PATH = "/backup/configs/db_credentials.conf"
-mysql_config = {}
+config = ConfigParser()
+config.read(CREDENTIALS_PATH)
 
-try:
-    config = configparser.ConfigParser()
-    config.read(CREDENTIALS_PATH)
+mysql_config = {
+    "user": config.get("credentials", "DB_USR"),
+    "password": config.get("credentials", "DB_PWD"),
+    "host": "localhost",
+    "database": "ti_db_inventory",
+    "port": 3306
+}
 
-    mysql_config["user"] = config.get("credentials", "DB_USR")
-    mysql_config["password"] = config.get("credentials", "DB_PWD")
-except Exception as e:
-    logging.error(f"Error loading MySQL credentials: {e}")
-    exit(1)
+# Log database user (without exposing password)
+logging.info(f"Using MySQL user: {mysql_config['user']}")
 
 # Load table schemas from JSON file
 SCHEMA_PATH = "/backup/configs/MYSQL_to_BigQuery_tables.json"
 with open(SCHEMA_PATH, "r") as f:
     schema_config = json.load(f)
-
-# MySQL database configuration
-mysql_config.update({
-    'host': 'localhost',
-    'database': 'ti_db_inventory',
-    'port': 3306
-})
 
 # Google BigQuery configuration
 KEY_FILE = "/root/jsonfiles/ti-dba-prod-01.json"
@@ -55,24 +50,36 @@ dataset_id = "ti_db_inventory"
 
 def create_engine_url():
     """Create SQLAlchemy engine URL safely"""
-    password = quote_plus(mysql_config['password'])
-    return create_engine(
-        f"mysql+pymysql://{mysql_config['user']}:{password}@{mysql_config['host']}:{mysql_config['port']}/{mysql_config['database']}"
-    )
-
-def cleanup_old_files():
-    """Delete JSON files older than 7 days from the dumps directory"""
     try:
-        current_time = datetime.now()
-        json_files = glob.glob(os.path.join(DUMPS_DIR, "*.json"))
-        
-        for file_path in json_files:
-            file_modified_time = datetime.fromtimestamp(os.path.getmtime(file_path))
-            if (current_time - file_modified_time) > timedelta(days=7):
-                os.remove(file_path)
-                logging.info(f"Deleted old file: {file_path}")
+        password = quote_plus(mysql_config['password'])  # Encode special characters in password
+        engine_url = f"mysql+pymysql://{mysql_config['user']}:{password}@{mysql_config['host']}:{mysql_config['port']}/{mysql_config['database']}"
+        return create_engine(engine_url)
     except Exception as e:
-        logging.error(f"Error during cleanup of old files: {e}")
+        logging.error(f"Error creating MySQL engine URL: {e}")
+        raise
+
+def get_mysql_tables():
+    """Get list of MySQL tables"""
+    engine = None
+    try:
+        engine = create_engine_url()
+        logging.info("Successfully created MySQL engine.")
+
+        with engine.connect() as connection:
+            logging.info("Connected to MySQL database.")
+
+            result = connection.execute("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'")
+            tables = [row[0] for row in result]
+
+            logging.info(f"Tables found in MySQL: {tables}")
+            return tables
+    except Exception as e:
+        logging.error(f"Error fetching MySQL tables: {e}")
+        raise
+    finally:
+        if engine:
+            engine.dispose()
+            logging.info("Closed MySQL connection.")
 
 def extract_from_mysql(table_name, is_daily=False):
     """Extract data from MySQL table"""
@@ -108,6 +115,82 @@ def extract_from_mysql(table_name, is_daily=False):
         if engine:
             engine.dispose()
 
+def transform_data(df, table_name):
+    """Transform the data according to table requirements"""
+    try:
+        if table_name == 'servers_temp':
+            bool_columns = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat', 
+                          'encrypted', 'ssl', 'backup', 'load', 'size', 'active']
+            for col in bool_columns:
+                if col in df.columns:
+                    df[col] = df[col].astype(bool)
+        
+        datetime_columns = {
+            'backup_log': ['backup_date', 'last_update'],
+            'daily_log': ['BackupDate', 'LastUpdate'],
+        }
+        
+        if table_name in datetime_columns:
+            for col in datetime_columns[table_name]:
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col])
+        
+        if table_name == 'daily_log':
+            df = df.rename(columns={
+                'backup_date': 'BackupDate',
+                'server': 'Server',
+                'database': 'Database',
+                'size': 'Size',
+                'state': 'State',
+                'last_update': 'LastUpdate'
+            })
+            df = df.drop(columns=['fileName'], errors='ignore')
+        
+        logging.info(f"Transformed data for table: {table_name}")
+        return df
+    except Exception as e:
+        logging.error(f"Error transforming data for table {table_name}: {e}")
+        raise
+
+def get_schema_from_config(table_name):
+    """Get BigQuery schema from JSON file"""
+    if table_name not in schema_config:
+        raise ValueError(f"No schema defined for table: {table_name}")
+    
+    schema = [
+        bigquery.SchemaField(field["name"], field["type"])
+        for field in schema_config[table_name]
+    ]
+    
+    return schema
+
+def load_to_bigquery(df, table_name, is_daily=False):
+    """Load data into BigQuery"""
+    try:
+        table_ref = f"{project_id}.{dataset_id}.{table_name}"
+        
+        job_config = bigquery.LoadJobConfig()
+        job_config.schema = get_schema_from_config(table_name)
+
+        if table_name == 'daily_log':
+            job_config.time_partitioning = bigquery.TimePartitioning(
+                type_=bigquery.TimePartitioningType.DAY,
+                field="BackupDate"
+            )
+        
+        job_config.write_disposition = bigquery.WriteDisposition.WRITE_APPEND if is_daily else bigquery.WriteDisposition.WRITE_TRUNCATE
+        
+        job = bq_client.load_table_from_dataframe(df, table_ref, job_config=job_config)
+        job.result()  # Wait for the job to complete
+        
+        table = bq_client.get_table(table_ref)
+        logging.info(f"Successfully loaded {len(df)} rows into BigQuery table: {table_name}")
+        logging.info(f"Total rows in table after load: {table.num_rows}")
+        
+    except Exception as e:
+        logging.error(f"Error loading data into BigQuery table {table_name}: {e}")
+        raise
+
 def run_etl(is_daily=False):
     """Main ETL process"""
     try:
@@ -123,8 +206,6 @@ def run_etl(is_daily=False):
             else:
                 logging.warning(f"No data extracted for table: {table_name}")
         
-        cleanup_old_files()
-        
     except Exception as e:
         logging.error(f"ETL process failed: {e}")
         raise
@@ -135,4 +216,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     run_etl(is_daily=args.daily)
-
