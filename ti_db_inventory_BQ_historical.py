@@ -14,7 +14,11 @@ from configparser import ConfigParser
 # Set up logging
 CURRENT_DATE = datetime.now().strftime("%Y-%m-%d")
 LOG_FILE = f"/backup/logs/MYSQL_to_BQ_{CURRENT_DATE}.log"
-logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 # Define the dumps directory
 DUMPS_DIR = "/backup/dumps"
@@ -48,10 +52,24 @@ bq_client = bigquery.Client()
 project_id = "ti-dba-prod-01"
 dataset_id = "ti_db_inventory"
 
+def cleanup_old_files():
+    """Delete JSON files older than 7 days from the dumps directory"""
+    try:
+        current_time = datetime.now()
+        json_files = glob.glob(os.path.join(DUMPS_DIR, "*.json"))
+        
+        for file_path in json_files:
+            file_modified_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+            if (current_time - file_modified_time) > timedelta(days=7):
+                os.remove(file_path)
+                logging.info(f"Deleted old file: {file_path}")
+    except Exception as e:
+        logging.error(f"Error during cleanup of old files: {e}")
+
 def create_engine_url():
     """Create SQLAlchemy engine URL safely"""
     try:
-        password = quote_plus(mysql_config['password'])  # Encode special characters in password
+        password = quote_plus(mysql_config['password'])
         engine_url = f"mysql+pymysql://{mysql_config['user']}:{password}@{mysql_config['host']}:{mysql_config['port']}/{mysql_config['database']}"
         return create_engine(engine_url)
     except Exception as e:
@@ -67,10 +85,11 @@ def get_mysql_tables():
 
         with engine.connect() as connection:
             logging.info("Connected to MySQL database.")
-
-            result = connection.execute("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'")
-            tables = [row[0] for row in result]
-
+            
+            query = "SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'"
+            df = pd.read_sql(query, connection)
+            
+            tables = df.iloc[:, 0].tolist()
             logging.info(f"Tables found in MySQL: {tables}")
             return tables
     except Exception as e:
@@ -104,7 +123,7 @@ def extract_from_mysql(table_name, is_daily=False):
         
         df.to_json(json_path, orient='records', lines=True)
         
-        logging.info(f"Successfully extracted data from MySQL table: {table_name}")
+        logging.info(f"Successfully extracted {len(df)} rows from MySQL table: {table_name}")
         logging.info(f"Saved extracted data to: {json_path}")
         
         return df
@@ -127,7 +146,7 @@ def transform_data(df, table_name):
         
         datetime_columns = {
             'backup_log': ['backup_date', 'last_update'],
-            'daily_log': ['BackupDate', 'LastUpdate'],
+            'daily_log': ['backup_date', 'last_update'],
         }
         
         if table_name in datetime_columns:
@@ -153,7 +172,7 @@ def transform_data(df, table_name):
         raise
 
 def get_schema_from_config(table_name):
-    """Get BigQuery schema from JSON file"""
+    """Get BigQuery schema from JSON configuration"""
     if table_name not in schema_config:
         raise ValueError(f"No schema defined for table: {table_name}")
     
@@ -171,14 +190,17 @@ def load_to_bigquery(df, table_name, is_daily=False):
         
         job_config = bigquery.LoadJobConfig()
         job_config.schema = get_schema_from_config(table_name)
-
+        
         if table_name == 'daily_log':
             job_config.time_partitioning = bigquery.TimePartitioning(
                 type_=bigquery.TimePartitioningType.DAY,
                 field="BackupDate"
             )
         
-        job_config.write_disposition = bigquery.WriteDisposition.WRITE_APPEND if is_daily else bigquery.WriteDisposition.WRITE_TRUNCATE
+        if is_daily:
+            job_config.write_disposition = bigquery.WriteDisposition.WRITE_APPEND
+        else:
+            job_config.write_disposition = bigquery.WriteDisposition.WRITE_TRUNCATE
         
         job = bq_client.load_table_from_dataframe(df, table_ref, job_config=job_config)
         job.result()  # Wait for the job to complete
@@ -206,6 +228,8 @@ def run_etl(is_daily=False):
             else:
                 logging.warning(f"No data extracted for table: {table_name}")
         
+        cleanup_old_files()
+        
     except Exception as e:
         logging.error(f"ETL process failed: {e}")
         raise
@@ -215,4 +239,15 @@ if __name__ == "__main__":
     parser.add_argument("--daily", action="store_true", help="Run daily update instead of full load")
     args = parser.parse_args()
 
-    run_etl(is_daily=args.daily)
+    try:
+        if args.daily:
+            logging.info("Starting daily ETL process")
+            run_etl(is_daily=True)
+            logging.info("Daily ETL process completed successfully")
+        else:
+            logging.info("Starting full historical ETL process")
+            run_etl(is_daily=False)
+            logging.info("Full historical ETL process completed successfully")
+    except Exception as e:
+        logging.error(f"Script execution failed: {e}")
+        raise
