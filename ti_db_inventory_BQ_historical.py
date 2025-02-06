@@ -1,6 +1,5 @@
-#!/bin/bash
-source /backup/environments/backupv1/bin/activate
-
+import subprocess
+import sys
 import pymysql
 import pandas as pd
 from google.cloud import bigquery
@@ -13,6 +12,15 @@ import argparse
 from sqlalchemy import create_engine, text
 from urllib.parse import quote_plus
 import tempfile
+
+# Activate the virtual environment
+subprocess.call("source /backup/environments/backupv1/bin/activate", shell=True, executable="/bin/bash")
+
+# Ensure the script runs with the correct Python binary
+python_bin = "/backup/environments/backupv1/bin/python3"
+if sys.executable != python_bin:
+    subprocess.call([python_bin] + sys.argv)
+    sys.exit()
 
 # Set up logging
 CURRENT_DATE = datetime.now().strftime("%Y-%m-%d")
