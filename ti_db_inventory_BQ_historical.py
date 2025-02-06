@@ -1,4 +1,3 @@
-import subprocess
 import sys
 import pymysql
 import pandas as pd
@@ -13,14 +12,10 @@ from sqlalchemy import create_engine, text
 from urllib.parse import quote_plus
 import tempfile
 
-# Activate the virtual environment
-subprocess.call("source /backup/environments/backupv1/bin/activate", shell=True, executable="/bin/bash")
-
-# Ensure the script runs with the correct Python binary
-python_bin = "/backup/environments/backupv1/bin/python3"
-if sys.executable != python_bin:
-    subprocess.call([python_bin] + sys.argv)
-    sys.exit()
+# Ensure the script runs with the correct Python binary from the virtual environment
+VENV_PYTHON = "/backup/environments/backupv1/bin/python3"
+if sys.executable != VENV_PYTHON:
+    os.execv(VENV_PYTHON, [VENV_PYTHON] + sys.argv)
 
 # Set up logging
 CURRENT_DATE = datetime.now().strftime("%Y-%m-%d")
@@ -85,6 +80,34 @@ def cleanup_old_files():
     except Exception as e:
         logging.error(f"Error during cleanup of old files: {e}")
 
+def extract_from_mysql(table_name):
+    """Extract data from MySQL table"""
+    engine = None
+    try:
+        engine = create_engine_url()
+        query = f"SELECT * FROM {table_name}"
+        df = pd.read_sql(query, engine)
+
+        # Convert datetime columns to string format
+        for col in df.select_dtypes(include=['datetime64[ns]']).columns:
+            df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+        logging.info(f"Successfully extracted {len(df)} rows from MySQL table: {table_name}")
+        return df
+    except Exception as e:
+        logging.error(f"Error extracting data from MySQL table {table_name}: {e}")
+        raise
+    finally:
+        if engine:
+            engine.dispose()
+
+def get_schema_from_config(table_name):
+    """Get BigQuery schema from JSON file"""
+    if table_name not in schema_config:
+        raise ValueError(f"No schema defined for table: {table_name}")
+    
+    return [bigquery.SchemaField(field["name"], field["type"]) for field in schema_config[table_name]]
+
 def load_to_bigquery(df, table_name):
     """Load data into BigQuery with WRITE_TRUNCATE to replace existing data"""
     try:
@@ -94,13 +117,7 @@ def load_to_bigquery(df, table_name):
         job_config.schema = get_schema_from_config(table_name)
         job_config.source_format = bigquery.SourceFormat.NEWLINE_DELIMITED_JSON
         job_config.write_disposition = bigquery.WriteDisposition.WRITE_TRUNCATE  # Overwrite existing data
-        
-        if table_name == 'daily_log':
-            job_config.time_partitioning = bigquery.TimePartitioning(
-                type_=bigquery.TimePartitioningType.DAY,
-                field="BackupDate"
-            )
-        
+
         # Create a temporary file
         with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.json') as temp_file:
             df.to_json(temp_file.name, orient='records', lines=True)
@@ -113,7 +130,7 @@ def load_to_bigquery(df, table_name):
                     job_config=job_config
                 )
                 job.result()  # Wait for the job to complete
-        
+
         os.unlink(temp_file.name)
         table = bq_client.get_table(table_ref)
         logging.info(f"Successfully loaded {len(df)} rows into BigQuery table: {table_name}")
@@ -123,13 +140,43 @@ def load_to_bigquery(df, table_name):
         logging.error(f"Error loading data into BigQuery table {table_name}: {e}")
         raise
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--daily", action="store_true", help="Run daily ETL process")
-    args = parser.parse_args()
-    
+def get_mysql_tables():
+    """Get list of MySQL tables"""
+    allowed_tables = ['backup_log', 'daily_log', 'servers_temp']
+    engine = None
     try:
-        run_etl(is_daily=args.daily)
+        engine = create_engine_url()
+        with engine.connect() as connection:
+            result = connection.execute(text("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'"))
+            tables = [row[0] for row in result if row[0] in allowed_tables]
+            return tables
+    finally:
+        if engine:
+            engine.dispose()
+
+def run_etl():
+    """Main ETL process"""
+    try:
+        tables = get_mysql_tables()
+        logging.info(f"Found tables in MySQL: {tables}")
+
+        for table_name in tables:
+            logging.info(f"Processing table: {table_name}")
+            df = extract_from_mysql(table_name)
+            if not df.empty:
+                load_to_bigquery(df, table_name)
+            else:
+                logging.warning(f"No data extracted for table: {table_name}")
+        
+        cleanup_old_files()
+        
+    except Exception as e:
+        logging.error(f"ETL process failed: {e}")
+        raise
+
+if __name__ == "__main__":
+    try:
+        run_etl()
         logging.info("ETL process completed successfully")
     except Exception as e:
         logging.error(f"Script execution failed: {e}")
