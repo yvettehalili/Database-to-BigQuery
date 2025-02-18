@@ -1,4 +1,4 @@
-This script orchestrates the ETL process.
+#This script orchestrates the ETL process.
 
 import logging
 import argparse
